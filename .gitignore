@@ -1,0 +1,41 @@
+# Results and experiment directories
+results/
+model_save/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Dataset
+datasets/
+dataset/
+
+# Checkpoints
+*.pt
+*.pth
+!pretrained/
