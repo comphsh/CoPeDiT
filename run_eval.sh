@@ -26,14 +26,17 @@
 
 set -e
 
-# ---- Path Configuration ----
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+# ============================================================
+# 全局路径变量（按实际修改）
+# ============================================================
+export COMPARE_ROOT="${COMPARE_ROOT:-/devdata2/hsh/program/python/methods/contrast_method_selected_of_diff_moe_synthesis/CoPeDiT__arxiv2026}"
+export DATA_ROOT="${DATA_ROOT:-/devdata/hsh/datasets/seg_dataset/BraTS2020/brats20-dataset-training-validation/versions/1/BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData}"
+export DATALIST_DIR="${DATALIST_DIR:-$COMPARE_ROOT/datalist/BraTS2020}"
+export EVAL_SCRIPT="${EVAL_SCRIPT:-/devdata2/hsh/program/python/methods/MySparseDiffusion/my_sparse_diff-moe-006/scripts/_01_vae/metrics/syn_metrics.py}"
 
-# Data paths
-DATA_ROOT="${DATA_ROOT:-/devdata/hsh/datasets/seg_dataset/BraTS2020/brats20-dataset-training-validation/versions/1/BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData}"
-DATALIST_DIR="${DATALIST_DIR:-$SCRIPT_DIR/datalist/BraTS2020}"
-EVAL_SCRIPT="${EVAL_SCRIPT:-/devdata2/hsh/program/python/methods/MySparseDiffusion/my_sparse_diff-moe-006/scripts/_01_vae/metrics/syn_metrics.py}"
+# ---- Path Configuration ----
+SCRIPT_DIR="$COMPARE_ROOT"
+cd "$SCRIPT_DIR"
 
 # GPU
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -113,7 +116,7 @@ if [ -z "$TASK_DIR" ]; then
         echo "Auto-detected task directory: $TASK_DIR"
     else
         TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-        TASK_DIR="$SCRIPT_DIR/results/task_${TIMESTAMP}_eval"
+        TASK_DIR="$COMPARE_ROOT/results/task_${TIMESTAMP}_eval"
         echo "Task directory: $TASK_DIR"
     fi
 fi

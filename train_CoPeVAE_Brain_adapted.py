@@ -44,7 +44,7 @@ from AutoEncoder.model.CoPeVAE_BrainMRI import CopeVAE
 from AutoEncoder.utils_brain import *
 from data.BraTS2020_data import (
     MODALITY_KEYS,
-    read_datalist,
+    read_train_val_datalist,
     get_transforms,
     get_loader_CoPeVAE,
 )
@@ -64,15 +64,13 @@ def train(args, autoencoder, discriminator):
     logger.info(f"Rank {args.rank}: Starting to load BraTS2020 data")
     logger.info(f"Data root: {args.data_root}")
     logger.info(f"Datalist dir: {args.datalist_dir}")
-    train_files, val_files, test_files = read_datalist(
+    train_files, val_files = read_train_val_datalist(
         args.datalist_dir, args.data_root
     )
     logger.info(
-        f"Loaded {len(train_files)} train, {len(val_files)} val, "
-        f"{len(test_files)} test samples"
+        f"Loaded {len(train_files)} train, {len(val_files)} val samples "
+        f"(test data NOT loaded — use eval.py for test)"
     )
-    train_files_combined = train_files
-    test_files_combined = val_files
     train_transform, test_transform = get_transforms(
         args, MODALITY_KEYS, is_train=True
     )
@@ -83,7 +81,7 @@ def train(args, autoencoder, discriminator):
     dataloader_train, dataloader_test, train_sampler, test_sampler = (
         get_loader_CoPeVAE(
             args, args.rank, args.world_size,
-            train_files_combined, test_files_combined,
+            train_files, val_files,
             train_transform, test_transform_eval,
         )
     )
@@ -447,16 +445,21 @@ if __name__ == "__main__":
             "brats20-dataset-training-validation/versions/1/"
             "BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData",
         ),
-        type=str, help="Root path to BraTS2020 TrainingData",
+        type=str, help="Root path to BraTS2020 TrainingData (env: DATA_ROOT)",
     )
     parser.add_argument(
         "--datalist_dir",
         default=os.environ.get(
             "DATALIST_DIR",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "datalist/BraTS2020"),
+            os.path.join(
+                os.environ.get(
+                    "COMPARE_ROOT",
+                    os.path.dirname(os.path.abspath(__file__)),
+                ),
+                "datalist/BraTS2020",
+            ),
         ),
-        type=str, help="Directory containing train.list, val.list, test.list",
+        type=str, help="Directory containing train.list, val.list (env: DATALIST_DIR)",
     )
     parser.add_argument("--dataset", default="BraTS", type=str)
     parser.add_argument("--epochs", default=200, type=int,

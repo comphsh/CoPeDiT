@@ -76,9 +76,51 @@ def mask_to_string(mask):
     return ''.join(str(int(m)) for m in mask)
 
 
+def _load_datalist_split(datalist_dir, data_root, split_name):
+    """Load a single datalist split file."""
+    list_path = os.path.join(datalist_dir, f"{split_name}.list")
+    if not os.path.exists(list_path):
+        raise FileNotFoundError(f"Datalist not found: {list_path}")
+
+    with open(list_path, "r") as f:
+        subject_ids = [line.strip() for line in f if line.strip()]
+
+    data_dicts = []
+    for sid in subject_ids:
+        item = {}
+        for mod in MODALITY_KEYS:
+            # BraTS2020 file naming: BraTS20_Training_XXX_{modality}.nii
+            item[mod] = os.path.join(data_root, sid, f"{sid}_{mod}.nii")
+        item["subject_id"] = sid
+        data_dicts.append(item)
+
+    return data_dicts
+
+
+def read_train_val_datalist(datalist_dir, data_root):
+    """
+    Read ONLY train and val datalist files (NEVER test).
+
+    Use this in training scripts to guarantee test data is never touched.
+
+    Args:
+        datalist_dir: Path to directory containing train.list, val.list
+        data_root: Root path to BraTS2020 TrainingData
+
+    Returns:
+        train_files, val_files: lists of dicts for MONAI DataLoader
+    """
+    train_files = _load_datalist_split(datalist_dir, data_root, "train")
+    val_files = _load_datalist_split(datalist_dir, data_root, "val")
+    return train_files, val_files
+
+
 def read_datalist(datalist_dir, data_root):
     """
-    Read datalist files and create MONAI-compatible data dicts.
+    Read ALL datalist files (train, val, test).
+
+    Use only in eval/test scripts that need the test split.
+    Training scripts should use read_train_val_datalist instead.
 
     Args:
         datalist_dir: Path to directory containing train.list, val.list, test.list
@@ -87,27 +129,10 @@ def read_datalist(datalist_dir, data_root):
     Returns:
         train_files, val_files, test_files: lists of dicts for MONAI DataLoader
     """
-    splits = {}
-    for split_name in ["train", "val", "test"]:
-        list_path = os.path.join(datalist_dir, f"{split_name}.list")
-        if not os.path.exists(list_path):
-            raise FileNotFoundError(f"Datalist not found: {list_path}")
-
-        with open(list_path, "r") as f:
-            subject_ids = [line.strip() for line in f if line.strip()]
-
-        data_dicts = []
-        for sid in subject_ids:
-            item = {}
-            for mod in MODALITY_KEYS:
-                # BraTS2020 file naming: BraTS20_Training_XXX_{modality}.nii
-                item[mod] = os.path.join(data_root, sid, f"{sid}_{mod}.nii")
-            item["subject_id"] = sid
-            data_dicts.append(item)
-
-        splits[split_name] = data_dicts
-
-    return splits["train"], splits["val"], splits["test"]
+    train_files = _load_datalist_split(datalist_dir, data_root, "train")
+    val_files = _load_datalist_split(datalist_dir, data_root, "val")
+    test_files = _load_datalist_split(datalist_dir, data_root, "test")
+    return train_files, val_files, test_files
 
 
 def get_transforms(args, keys, is_train=True):
@@ -185,7 +210,7 @@ def get_transforms(args, keys, is_train=True):
     return transform
 
 
-def random_mask_sample(x_in, seed):
+def random_mask_sample(x_in, seed, fixed_missing_num=None):
     """
     Randomly mask modalities for training.
     Excludes all-0 (no input) and all-1 (nothing to generate) cases.
@@ -193,6 +218,8 @@ def random_mask_sample(x_in, seed):
     Args:
         x_in: Full modality tensor [1, 4, H, W, D]
         seed: Random seed for reproducibility
+        fixed_missing_num: If set (1/2/3), use this exact missing count.
+                           If None, randomly choose 1, 2, or 3.
 
     Returns:
         x_available: Available modalities [1, N_avail, H, W, D]
@@ -202,8 +229,11 @@ def random_mask_sample(x_in, seed):
     torch.manual_seed(seed)
     modality = x_in.shape[1]  # 4
 
-    # Random number of missing modalities: 1, 2, or 3
-    missing_num = int(torch.randint(1, modality, (1,)).item())
+    # Number of missing modalities: fixed or random
+    if fixed_missing_num is not None:
+        missing_num = fixed_missing_num
+    else:
+        missing_num = int(torch.randint(1, modality, (1,)).item())
 
     comp_list = list(range(modality))
     indices = torch.randperm(modality)[:missing_num]
@@ -330,7 +360,7 @@ def collate_fn_MDiT3D(batch, missing_num=1):
             [item[k] for k in MODALITY_KEYS], dim=1
         )  # [1, 4, H, W, D]
 
-        x_avail, x_miss, mask = random_mask_sample(img, seed)
+        x_avail, x_miss, mask = random_mask_sample(img, seed, fixed_missing_num=missing_num)
         x_available_list.append(x_avail)
         x_missing_list.append(x_miss)
         missing_cond_list.append(mask)

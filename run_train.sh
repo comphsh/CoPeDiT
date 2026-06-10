@@ -25,13 +25,16 @@
 
 set -e  # Exit on error
 
-# ---- Path Configuration ----
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+# ============================================================
+# 全局路径变量（按实际修改）
+# ============================================================
+export COMPARE_ROOT="${COMPARE_ROOT:-/devdata2/hsh/program/python/methods/contrast_method_selected_of_diff_moe_synthesis/CoPeDiT__arxiv2026}"
+export DATA_ROOT="${DATA_ROOT:-/devdata/hsh/datasets/seg_dataset/BraTS2020/brats20-dataset-training-validation/versions/1/BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData}"
+export DATALIST_DIR="${DATALIST_DIR:-$COMPARE_ROOT/datalist/BraTS2020}"
 
-# Data paths
-DATA_ROOT="${DATA_ROOT:-/devdata/hsh/datasets/seg_dataset/BraTS2020/brats20-dataset-training-validation/versions/1/BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData}"
-DATALIST_DIR="${DATALIST_DIR:-$SCRIPT_DIR/datalist/BraTS2020}"
+# ---- Path Configuration ----
+SCRIPT_DIR="$COMPARE_ROOT"
+cd "$SCRIPT_DIR"
 
 # GPU
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -127,14 +130,14 @@ fi
 
 # ---- Find latest CoPeVAE checkpoint ----
 if [ -z "$AE_CKPT" ]; then
-    LATEST_RESULTS=$(ls -dt "$SCRIPT_DIR"/results/task_*/ 2>/dev/null | head -1)
+    LATEST_RESULTS=$(ls -dt "$COMPARE_ROOT"/results/task_*/ 2>/dev/null | head -1)
     if [ -z "$LATEST_RESULTS" ]; then
         echo "ERROR: No results directory found. Stage 1 training may have failed."
         exit 1
     fi
     AE_CKPT="$LATEST_RESULTS/models/CoPeVAE/Autoencoder.pt"
     if [ ! -f "$AE_CKPT" ]; then
-        AE_CKPT=$(find "$SCRIPT_DIR"/results -name "Autoencoder.pt" -path "*/CoPeVAE/*" 2>/dev/null | sort | tail -1)
+        AE_CKPT=$(find "$COMPARE_ROOT"/results -name "Autoencoder.pt" -path "*/CoPeVAE/*" 2>/dev/null | sort | tail -1)
     fi
 fi
 
@@ -186,10 +189,10 @@ echo " Training Complete!"
 echo "=============================================="
 echo ""
 echo "Model checkpoints saved in:"
-echo "  $SCRIPT_DIR/results/task_*/models/"
+echo "  $COMPARE_ROOT/results/task_*/models/"
 echo ""
 echo "To monitor training:"
-echo "  tensorboard --logdir $SCRIPT_DIR/results/task_*/tensorboard/"
+echo "  tensorboard --logdir $COMPARE_ROOT/results/task_*/tensorboard/"
 echo ""
 echo "To run evaluation:"
 echo "  bash run_eval.sh --ae_ckpt <path> --dit_ckpt <path>"
