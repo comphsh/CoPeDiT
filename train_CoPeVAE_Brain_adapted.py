@@ -156,6 +156,8 @@ def train(args, autoencoder, discriminator):
     best_train_loss = 1000
     start_epoch = 0
     max_epochs = args.epochs
+    global_step = 0
+    total_steps_per_epoch = len(dataloader_train)
     start = timeit.default_timer()
     logger.info(f"Rank {args.rank}: Start Training (CoPeVAE Stage 1)")
     for epoch in range(start_epoch, max_epochs):
@@ -170,10 +172,12 @@ def train(args, autoencoder, discriminator):
             "len_loss": 0, "loc_loss": 0, "con_loss": 0,
         }
         progress_bar = tqdm(
-            enumerate(dataloader_train), total=len(dataloader_train), ncols=150
+            enumerate(dataloader_train), total=total_steps_per_epoch, ncols=160
         )
-        progress_bar.set_description(f"Epoch {epoch}")
+        progress_bar.set_description(f"Epoch {epoch}/{max_epochs}")
         for i, batch in progress_bar:
+            global_step += 1
+            progress_bar.set_postfix({"G": global_step})
             x_incomp, x_missing, missing_length, missing_label = batch
             x_incomp, x_missing, missing_length, missing_label = (
                 x_incomp.to(args.device), x_missing.to(args.device),
@@ -273,10 +277,10 @@ def train(args, autoencoder, discriminator):
             writer.add_scalar("LR/lr", current_lr, epoch)
         if args.rank == 0:
             print(
-                "[Epoch: %d][Time: %d][L: %.4f][L_rec: %.4f]"
+                "[Epoch: %d/%d][G: %d][Time: %d][L: %.4f][L_rec: %.4f]"
                 "[L_vq: %.4f][L_per: %.4f][L_disc: %.4f][L_pretext: %.4f]"
                 "[l_len: %.4f][l_loc: %.4f][l_con: %.4f][lr: %.6f]"
-                % (epoch, elapsed, loss_g_total,
+                % (epoch, max_epochs, global_step, elapsed, loss_g_total,
                    train_epoch_losses["rec_loss"], train_epoch_losses["vq_loss"],
                    train_epoch_losses["per_loss"], train_epoch_losses["disc_loss"],
                    train_epoch_losses["pretext_loss"], train_epoch_losses["len_loss"],
@@ -284,10 +288,10 @@ def train(args, autoencoder, discriminator):
                    current_lr)
             )
         logger.info(
-            "[Epoch: %d][Time: %d][L: %.4f][L_rec: %.4f][L_vq: %.4f]"
+            "[Epoch: %d/%d][G: %d][Time: %d][L: %.4f][L_rec: %.4f][L_vq: %.4f]"
             "[L_per: %.4f][L_disc: %.4f][L_pretext: %.4f]"
             "[l_len: %.4f][l_loc: %.4f][l_con: %.4f][lr: %.6f]"
-            % (epoch, elapsed, loss_g_total,
+            % (epoch, max_epochs, global_step, elapsed, loss_g_total,
                train_epoch_losses["rec_loss"], train_epoch_losses["vq_loss"],
                train_epoch_losses["per_loss"], train_epoch_losses["disc_loss"],
                train_epoch_losses["pretext_loss"], train_epoch_losses["len_loss"],

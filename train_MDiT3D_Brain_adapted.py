@@ -157,6 +157,8 @@ def train(args, autoencoder, DiT):
     val_interval = args.val_interval
     start_epoch = 0
     max_epochs = args.epochs
+    global_step = 0
+    total_steps_per_epoch = len(dataloader_train)
     start = timeit.default_timer()
     if args.distributed:
         DiT = DistributedDataParallel(DiT, device_ids=[args.rank])
@@ -181,10 +183,12 @@ def train(args, autoencoder, DiT):
         DiT.train()
         train_epoch_losses = {"diff_loss": 0}
         progress_bar = tqdm(
-            enumerate(dataloader_train), total=len(dataloader_train), ncols=150
+            enumerate(dataloader_train), total=total_steps_per_epoch, ncols=160
         )
-        progress_bar.set_description(f"Epoch {epoch}")
+        progress_bar.set_description(f"Epoch {epoch}/{max_epochs}")
         for i, batch in progress_bar:
+            global_step += 1
+            progress_bar.set_postfix({"G": global_step})
             x_available, x_missing, missing_condition = batch
             x_available = x_available.to(args.device)
             x_missing = x_missing.to(args.device)
@@ -257,12 +261,12 @@ def train(args, autoencoder, DiT):
             writer.add_scalar("LR/lr", current_lr, epoch)
         if args.rank == 0:
             print(
-                "[Train Epoch: %d][Time: %d][L: %.4f][lr: %.6f]"
-                % (epoch, elapsed, diff_loss_epoch, current_lr)
+                "[Train Epoch: %d/%d][G: %d][Time: %d][L: %.4f][lr: %.6f]"
+                % (epoch, max_epochs, global_step, elapsed, diff_loss_epoch, current_lr)
             )
         logger.info(
-            "[Train Epoch: %d][Time: %d][L: %.4f][lr: %.6f]"
-            % (epoch, elapsed, diff_loss_epoch, current_lr)
+            "[Train Epoch: %d/%d][G: %d][Time: %d][L: %.4f][lr: %.6f]"
+            % (epoch, max_epochs, global_step, elapsed, diff_loss_epoch, current_lr)
         )
         if args.distributed:
             if args.rank == 0:

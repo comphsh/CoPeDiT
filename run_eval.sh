@@ -1,26 +1,29 @@
 #!/bin/bash
 # ==============================================================================
-# CoPeDiT Evaluation Launch Script for BraTS2020
+# CoPeDiT Inference Launch Script for BraTS2020
 # ==============================================================================
 #
-# Generates missing modalities for all 14 mask patterns on the test set,
-# then computes image quality metrics (SSIM/PSNR/MSE/MAE/LPIPS).
+# Generates missing modalities for all 14 mask patterns on the test set.
+# Saves ONLY synthetic images (no GT) under prediction/{mask_str}/{subject_id}/.
 #
 # Usage:
 #   bash run_eval.sh --ae_ckpt <CoPeVAE checkpoint> --dit_ckpt <MDiT3D checkpoint>
-#   bash run_eval.sh --ae_ckpt results/task_20250101_120000/models/CoPeVAE/Autoencoder.pt \
-#                    --dit_ckpt results/task_20250101_120000/models/MDiT3D/DiT.pt
+#   bash run_eval.sh --ae_ckpt results/task_XXXXXX/models/CoPeVAE/Autoencoder.pt \
+#                    --dit_ckpt results/task_XXXXXX/models/MDiT3D/DiT.pt
+#
+# After inference, use your global eval script for metrics:
+#   python syn_metric.py --pred_path $TASK_DIR/prediction
 #
 # Options:
 #   --ae_ckpt PATH         Path to trained CoPeVAE checkpoint (required)
 #   --dit_ckpt PATH        Path to trained MDiT3D checkpoint (required)
-#   --task_dir PATH        Output directory (auto: results/task_{timestamp}/)
+#   --task_dir PATH        Output directory (auto: results/task_{timestamp}_eval)
 #   --gpu ID               GPU device ID (default: 0)
 #
 # Environment variables:
+#   COMPARE_ROOT           Project root
 #   DATA_ROOT              Path to BraTS2020 TrainingData
 #   DATALIST_DIR           Path to datalist directory
-#   EVAL_SCRIPT            Path to evaluation script
 #   CUDA_VISIBLE_DEVICES   GPU device ID
 # ==============================================================================
 
@@ -32,7 +35,6 @@ set -e
 export COMPARE_ROOT="${COMPARE_ROOT:-/devdata2/hsh/program/python/methods/contrast_method_selected_of_diff_moe_synthesis/CoPeDiT__arxiv2026}"
 export DATA_ROOT="${DATA_ROOT:-/devdata/hsh/datasets/seg_dataset/BraTS2020/brats20-dataset-training-validation/versions/1/BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData}"
 export DATALIST_DIR="${DATALIST_DIR:-$COMPARE_ROOT/datalist/BraTS2020}"
-export EVAL_SCRIPT="${EVAL_SCRIPT:-/devdata2/hsh/program/python/methods/MySparseDiffusion/my_sparse_diff-moe-006/scripts/_01_vae/metrics/syn_metrics.py}"
 
 # ---- Path Configuration ----
 SCRIPT_DIR="$COMPARE_ROOT"
@@ -69,7 +71,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: bash run_eval.sh --ae_ckpt <CoPeVAE ckpt> --dit_ckpt <MDiT3D ckpt> [--task_dir PATH] [--gpu ID]"
+            echo "Usage: bash run_eval.sh --ae_ckpt <path> --dit_ckpt <path> [--task_dir PATH] [--gpu ID]"
             exit 1
             ;;
     esac
@@ -99,11 +101,10 @@ if [ ! -f "$DIT_CKPT" ]; then
 fi
 
 echo "=============================================="
-echo " CoPeDiT Evaluation on BraTS2020"
+echo " CoPeDiT Inference on BraTS2020"
 echo "=============================================="
 echo "Data root:      $DATA_ROOT"
 echo "Datalist dir:   $DATALIST_DIR"
-echo "Eval script:    $EVAL_SCRIPT"
 echo "GPU device:     $CUDA_VISIBLE_DEVICES"
 echo "AE checkpoint:  $AE_CKPT"
 echo "DiT checkpoint: $DIT_CKPT"
@@ -121,9 +122,9 @@ if [ -z "$TASK_DIR" ]; then
     fi
 fi
 
-# ---- Run evaluation ----
+# ---- Run inference ----
 echo ""
-echo "Starting evaluation..."
+echo "Starting inference (73 patients × 14 masks = 1022 generations)..."
 echo ""
 
 python eval.py \
@@ -131,30 +132,23 @@ python eval.py \
     --dit_ckpt "$DIT_CKPT" \
     --data_root "$DATA_ROOT" \
     --datalist_dir "$DATALIST_DIR" \
-    --eval_script "$EVAL_SCRIPT" \
     --task_dir "$TASK_DIR"
 
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
-    echo "ERROR: Evaluation failed with exit code $EXIT_CODE"
+    echo "ERROR: Inference failed with exit code $EXIT_CODE"
     exit $EXIT_CODE
 fi
 
 echo ""
 echo "=============================================="
-echo " Evaluation Complete!"
+echo " Inference Complete!"
 echo "=============================================="
 echo ""
-echo "Outputs:"
-echo "  Predictions: $TASK_DIR/prediction/"
-echo "  Metrics:     $TASK_DIR/prediction_metric_result/"
+echo "Synthetic images saved to:"
+echo "  $TASK_DIR/prediction/{0001..1110}/{subject_id}/"
 echo ""
-echo "To view per-mask results:"
-for mask_id in $(seq 1 14); do
-    result_file="$TASK_DIR/prediction_metric_result/$mask_id/result.txt"
-    if [ -f "$result_file" ]; then
-        echo "  Mask $mask_id: $(cat "$result_file" | tail -1)"
-    fi
-done
+echo "Next: compute metrics with global eval script, e.g.:"
+echo "  python syn_metric.py --pred_path $TASK_DIR/prediction"
 echo ""

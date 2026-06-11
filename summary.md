@@ -75,9 +75,6 @@ CoPeDiT__arxiv2026/
 export COMPARE_ROOT=/devdata2/hsh/program/python/methods/contrast_method_selected_of_diff_moe_synthesis/CoPeDiT__arxiv2026
 export DATA_ROOT=/devdata/hsh/datasets/seg_dataset/BraTS2020/brats20-dataset-training-validation/versions/1/BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData
 export DATALIST_DIR=$COMPARE_ROOT/datalist/BraTS2020
-
-# 指标计算脚本（来自 MySparseDiffusion 项目）
-export EVAL_SCRIPT=/devdata2/hsh/program/python/methods/MySparseDiffusion/my_sparse_diff-moe-006/scripts/_01_vae/metrics/syn_metrics.py
 # ============================================================
 ```
 
@@ -376,15 +373,14 @@ tail -f $COMPARE_ROOT/results/task_*/stage2_MDiT3D/log/*.log
 
 ## 7 推理命令 (eval.py)
 
-> **eval.py 负责两件事**：① 加载模型 → 14 种 mask 逐样本生成 → 保存 NIfTI；② 调用 `ImageQualityEvaluator` 计算指标。
-> 可通过 `--metrics_only` 跳过推理，仅重算指标。
+> **eval.py 只做推理**：加载模型 → 14 种 mask 逐样本生成 → 只保存合成图像。
+> GT 由全局统一数据集提供，不重复保存。指标由外部全局评估脚本计算。
 
 ### 7.1 方式 A：一键启动
 
 ```bash
 cd $COMPARE_ROOT
 
-# 完整推理 + 指标
 bash run_eval.sh \
     --ae_ckpt results/task_XXXXXX/models/CoPeVAE/Autoencoder.pt \
     --dit_ckpt results/task_XXXXXX/models/MDiT3D/DiT.pt
@@ -395,118 +391,53 @@ bash run_eval.sh \
 ```bash
 cd $COMPARE_ROOT
 
-# ============================================================
 # 完整推理 (73 samples × 14 masks = 1022 generations)
 # 预计耗时: 6-12 小时 (单 GPU, DDIM 200 steps)
-# ============================================================
 python eval.py \
     --ae_ckpt results/task_XXXXXX/models/CoPeVAE/Autoencoder.pt \
     --dit_ckpt results/task_XXXXXX/models/MDiT3D/DiT.pt \
     --data_root "$DATA_ROOT" \
     --datalist_dir "$DATALIST_DIR" \
-    --task_dir "$COMPARE_ROOT/results/task_eval_manual" \
-    --sample_steps 200 \
-    --pred_type x \
-    --batch_size 1
-
-# ============================================================
-# 仅重算指标（跳过推理，需要已有 prediction 目录）
-# ============================================================
-python eval.py \
-    --ae_ckpt results/task_XXXXXX/models/CoPeVAE/Autoencoder.pt \
-    --dit_ckpt results/task_XXXXXX/models/MDiT3D/DiT.pt \
     --task_dir "$COMPARE_ROOT/results/task_XXXXXX" \
-    --metrics_only
+    --sample_steps 200 \
+    --pred_type x
 ```
 
 ### 7.3 推理输出结构
 
 ```
 results/task_{timestamp}/
-├── prediction/
-│   ├── 1/                        # mask=0001: 仅 t2 可用 (3-missing)
-│   │   ├── input/                # 可用模态 → 模型输入
-│   │   │   └── BraTS20_Training_137/
-│   │   │       └── BraTS20_Training_137_t2.nii.gz
-│   │   ├── ground_truth/         # 缺失模态 → 原始真值
-│   │   │   └── BraTS20_Training_137/
-│   │   │       ├── BraTS20_Training_137_flair.nii.gz
-│   │   │       ├── BraTS20_Training_137_t1.nii.gz
-│   │   │       └── BraTS20_Training_137_t1ce.nii.gz
-│   │   └── prediction/           # 缺失模态 → 模型生成
-│   │       └── BraTS20_Training_137/
-│   │           ├── BraTS20_Training_137_flair.nii.gz
-│   │           ├── BraTS20_Training_137_t1.nii.gz
-│   │           └── BraTS20_Training_137_t1ce.nii.gz
-│   ├── 2/                        # mask=0010: 仅 t1ce 可用
-│   ├── ...
-│   └── 14/                       # mask=1110: 缺 t2 (1-missing)
-│
-└── prediction_metric_result/
-    ├── 1/result.txt
-    ├── 2/result.txt
-    ├── ...
-    └── 14/result.txt
+└── prediction/
+    ├── 0001/                       # 仅 t2 可用 (3-missing)
+    │   ├── BraTS20_Training_137/
+    │   │   ├── BraTS20_Training_137_flair.nii.gz  (合成)
+    │   │   ├── BraTS20_Training_137_t1.nii.gz     (合成)
+    │   │   └── BraTS20_Training_137_t1ce.nii.gz   (合成)
+    │   └── ...
+    ├── 0010/                       # 仅 t1ce 可用 (3-missing)
+    ├── 0100/                       # 仅 t1 可用 (3-missing)
+    ├── 1000/                       # 仅 flair 可用 (3-missing)
+    ├── 0011/                       # t1ce+t2 可用 (2-missing)
+    ├── 0101/                       # t1+t2 可用 (2-missing)
+    ├── 0110/                       # t1+t1ce 可用 (2-missing)
+    ├── 1001/                       # flair+t2 可用 (2-missing)
+    ├── 1010/                       # flair+t1ce 可用 (2-missing)
+    ├── 1100/                       # flair+t1 可用 (2-missing)
+    ├── 0111/                       # 缺 flair (1-missing)
+    ├── 1011/                       # 缺 t1 (1-missing)
+    ├── 1101/                       # 缺 t1ce (1-missing)
+    └── 1110/                       # 缺 t2 (1-missing)
 ```
 
-### 7.4 result.txt 格式
+**Mask 编码规则**：4 位二进制字符串，顺序 `[flair, t1, t1ce, t2]`，`1`=可用，`0`=缺失（需要合成）。每个 mask 目录下只保存缺失模态的合成图像。
 
-```
-ssim     psnr     mse      mae      fid     lpips
-0.891234   28.456789  0.001234  0.012345  -1.000000   0.056789
-```
-
-> **注意**: `fid` 为 -1 表示未计算（3D 体数据无法逐样本计算 FID）。
-
----
-
-## 8 查看与汇总结果
+### 7.4 后续：计算指标
 
 ```bash
-TASK_TS="XXXXXX"  # 替换为实际时间戳
-METRIC_DIR="$COMPARE_ROOT/results/task_$TASK_TS/prediction_metric_result"
-
-# ============================================================
-# 逐 mask 查看
-# ============================================================
-for mask_id in $(seq 1 14); do
-    f="$METRIC_DIR/$mask_id/result.txt"
-    if [ -f "$f" ]; then
-        printf "Mask %-2d: %s\n" "$mask_id" "$(tail -1 "$f")"
-    fi
-done
-
-# ============================================================
-# 按缺失数分类汇总
-# ============================================================
-echo ""
-echo "=============================================="
-echo " CoPeDiT BraTS2020 评估结果汇总"
-echo "=============================================="
-printf "%-8s %-8s %-10s %-10s %-12s %-12s %-10s\n" \
-    "mask" "type" "ssim" "psnr" "mse" "mae" "lpips"
-echo "--------------------------------------------------------------------"
-
-ONE_MISS=(11 12 13 14)
-TWO_MISS=(5 6 7 8 9 10)
-THREE_MISS=(1 2 3 4)
-
-for mask_id in "${ONE_MISS[@]}"; do
-    f="$METRIC_DIR/$mask_id/result.txt"
-    vals=$(tail -1 "$f" 2>/dev/null || echo "N/A")
-    printf "%-8s %-8s %s\n" "$mask_id" "1-miss" "$vals"
-done
-for mask_id in "${TWO_MISS[@]}"; do
-    f="$METRIC_DIR/$mask_id/result.txt"
-    vals=$(tail -1 "$f" 2>/dev/null || echo "N/A")
-    printf "%-8s %-8s %s\n" "$mask_id" "2-miss" "$vals"
-done
-for mask_id in "${THREE_MISS[@]}"; do
-    f="$METRIC_DIR/$mask_id/result.txt"
-    vals=$(tail -1 "$f" 2>/dev/null || echo "N/A")
-    printf "%-8s %-8s %s\n" "$mask_id" "3-miss" "$vals"
-done
-echo "--------------------------------------------------------------------"
+# 使用全局统一的评估脚本计算指标
+python syn_metric.py \
+    --pred_path $COMPARE_ROOT/results/task_XXXXXX/prediction \
+    --gt_path $DATA_ROOT
 ```
 
 ---
@@ -526,21 +457,19 @@ cd $COMPARE_ROOT
 
 # Step 1: 训练 Stage 1 (CoPeVAE) — ~12-24 小时
 echo "================================"
-echo " Step 1/4: 训练 CoPeVAE"
+echo " Step 1/3: Train CoPeVAE"
 echo "================================"
 python train_CoPeVAE_Brain_adapted.py \
     --data_root "$DATA_ROOT" --datalist_dir "$DATALIST_DIR" \
     --epochs 200 --batch_size 2 --lr 1e-4 \
     --val_interval 5 --ckpt_interval 50
 
-# 获取 Stage 1 的 task 时间戳
 TASK_TS=$(ls -t $COMPARE_ROOT/results/task_* 2>/dev/null | head -1 | grep -oP 'task_\K.*')
-echo "Task timestamp: $TASK_TS"
 
 # Step 2: 训练 Stage 2 (MDiT3D) — ~12-24 小时
 echo ""
 echo "================================"
-echo " Step 2/4: 训练 MDiT3D"
+echo " Step 2/3: Train MDiT3D"
 echo "================================"
 python train_MDiT3D_Brain_adapted.py \
     --data_root "$DATA_ROOT" --datalist_dir "$DATALIST_DIR" \
@@ -548,10 +477,10 @@ python train_MDiT3D_Brain_adapted.py \
     --epochs 200 --batch_size 2 --missing_num 1 --lr 5e-5 \
     --val_interval 20 --ckpt_interval 50
 
-# Step 3: 推理生成 — ~6-12 小时
+# Step 3: 推理 — ~6-12 小时
 echo ""
 echo "================================"
-echo " Step 3/4: 推理 (14 种 mask)"
+echo " Step 3/3: Inference"
 echo "================================"
 python eval.py \
     --ae_ckpt "$COMPARE_ROOT/results/task_$TASK_TS/models/CoPeVAE/Autoencoder.pt" \
@@ -559,24 +488,13 @@ python eval.py \
     --data_root "$DATA_ROOT" --datalist_dir "$DATALIST_DIR" \
     --task_dir "$COMPARE_ROOT/results/task_$TASK_TS"
 
-# Step 4: 查看结果
 echo ""
 echo "================================"
-echo " Step 4/4: 查看指标"
-echo "================================"
-for mask_id in $(seq 1 14); do
-    f="$COMPARE_ROOT/results/task_$TASK_TS/prediction_metric_result/$mask_id/result.txt"
-    if [ -f "$f" ]; then
-        printf "Mask %-2d: %s\n" "$mask_id" "$(tail -1 "$f")"
-    fi
-done
-
+echo " Done!"
+echo " Models: $COMPARE_ROOT/results/task_$TASK_TS/models/"
+echo " Preds:  $COMPARE_ROOT/results/task_$TASK_TS/prediction/"
 echo ""
-echo "================================"
-echo " ✅ 全部完成！"
-echo " 模型: $COMPARE_ROOT/results/task_$TASK_TS/models/"
-echo " 预测: $COMPARE_ROOT/results/task_$TASK_TS/prediction/"
-echo " 指标: $COMPARE_ROOT/results/task_$TASK_TS/prediction_metric_result/"
+echo " Next: python syn_metric.py --pred_path prediction/"
 echo "================================"
 ```
 

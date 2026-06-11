@@ -1,22 +1,24 @@
 #!/usr/bin/env python
 """
-Evaluation Script for CoPeDiT on BraTS2020.
+CoPeDiT Inference Script for BraTS2020 Test Set.
 
-For each test sample:
-- Generate missing modalities for all 14 missing-modality masks
-- Save inputs (available), ground truth (missing), predictions (generated)
-- Compute image quality metrics using the unified EVAL_SCRIPT
+For each test sample × 14 missing-modality masks:
+- Generate missing modalities via DDIM sampling
+- Save ONLY synthetic images (no GT — global dataset serves as GT)
+
+Output structure (mask_str = 4-bit binary, 1=available, 0=missing):
+    results/task_{timestamp}/prediction/
+        {mask_str}/
+            {subject_id}/
+                {subject_id}_{missing_mod}.nii.gz    # synthetic image only
 
 Usage:
-    python eval.py --ae_ckpt <CoPeVAE checkpoint> --dit_ckpt <MDiT3D checkpoint>
+    python eval.py --ae_ckpt <CoPeVAE ckpt> --dit_ckpt <MDiT3D ckpt>
 
-Directory structure per mask_id:
-    results/task_{timestamp}/
-        prediction/{mask_id}/
-            input/           # Available modality images
-            ground_truth/    # GT of missing modalities
-            prediction/      # Generated missing modalities
-        prediction_metric_result/{mask_id}/result.txt
+Environment:
+    COMPARE_ROOT   Project root (default: script dir)
+    DATA_ROOT      BraTS2020 TrainingData path
+    DATALIST_DIR   Directory containing test.list
 """
 
 import argparse
@@ -28,41 +30,34 @@ import torch
 import nibabel as nib
 from datetime import datetime
 from tqdm import tqdm
-from einops import rearrange
 
 from torch.cuda.amp import autocast
 
-# Add project root to path
-PROJ_ROOT = os.path.dirname(os.path.abspath(__file__))
+# Project root — respect COMPARE_ROOT env
+PROJ_ROOT = os.environ.get("COMPARE_ROOT", os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJ_ROOT)
 
 from AutoEncoder.model.CoPeVAE_BrainMRI import CopeVAE
 from LDM.model.MDiT3D_Brain import MDiT3D_models
 from LDM.inferers import inferer_DiT_Brain
-from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
+from generative.networks.schedulers import DDIMScheduler
 from generative.networks.schedulers.ddim import DDIMPredictionType
 
 from monai.transforms import (
-    Compose, LoadImage, EnsureChannelFirst, EnsureType,
-    Orientation, ScaleIntensityRangePercentilesd,
-    CenterSpatialCrop, Resize, ToTensor,
+    Compose, LoadImaged, EnsureChannelFirstd, EnsureTyped,
+    Orientationd, ScaleIntensityRangePercentilesd,
+    CenterSpatialCropd, Resized, ToTensord,
 )
-from monai.data import DataLoader, Dataset
 
 from data.BraTS2020_data import (
     MODALITY_KEYS, MASK_LIST, mask_to_string, read_datalist,
-    get_transforms, fixed_mask_sample,
 )
 
 
 def get_eval_transforms(args):
-    """
-    Build MONAI transforms for evaluation (same as test transforms but also
-    usable for individual modality loading).
-    """
-    from monai.transforms import Compose as ComposeD
+    """Build MONAI transforms for evaluation (batch_size=1 per-sample loading)."""
     keys = MODALITY_KEYS
-    transform = ComposeD([
+    transform = Compose([
         LoadImaged(keys=keys, image_only=True, allow_missing_keys=True),
         EnsureChannelFirstd(keys=keys, allow_missing_keys=True),
         EnsureTyped(keys=keys),
@@ -85,14 +80,7 @@ def get_eval_transforms(args):
 
 
 def save_nifti(data, affine, filepath, is_tensor=True):
-    """
-    Save a 3D volume as NIfTI.
-
-    Args:
-        data: numpy array or torch tensor of shape (H, W, D)
-        affine: affine matrix
-        filepath: output path
-    """
+    """Save a 3D volume as NIfTI."""
     if is_tensor:
         data = data.detach().cpu().numpy()
     data = np.squeeze(data).astype(np.float32)
@@ -101,144 +89,19 @@ def save_nifti(data, affine, filepath, is_tensor=True):
     nib.save(img, filepath)
 
 
-def compute_metrics(args, test_files, prediction_root, metric_result_root, device):
-    """Compute image quality metrics from saved predictions (no model needed)."""
-    print("\n" + "=" * 60)
-    print("Computing image quality metrics...")
-    print("=" * 60)
-
-    eval_script_path = os.environ.get("EVAL_SCRIPT", args.eval_script)
-    eval_dir = os.path.dirname(eval_script_path)
-    if eval_dir not in sys.path:
-        sys.path.insert(0, eval_dir)
-
-    try:
-        from syn_metrics import ImageQualityEvaluator
-        evaluator = ImageQualityEvaluator(
-            LPIPS_model_type='nomedical', device=str(device)
-        )
-    except ImportError as e:
-        print(f"Warning: Could not import from EVAL_SCRIPT: {e}")
-        print("Attempting direct import...")
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "syn_metrics", eval_script_path
-        )
-        syn_metrics = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(syn_metrics)
-        evaluator = syn_metrics.ImageQualityEvaluator(
-            LPIPS_model_type='nomedical', device=str(device)
-        )
-
-    for mask_idx, mask in enumerate(MASK_LIST):
-        mask_id = mask_idx + 1
-        mask_str = mask_to_string(mask)
-        missing_idx = [i for i, m in enumerate(mask) if m == 0]
-
-        print(f"\n--- Mask {mask_id}/{len(MASK_LIST)}: {mask_str} ---")
-
-        mask_pred_dir = os.path.join(prediction_root, str(mask_id), "prediction")
-        mask_gt_dir = os.path.join(prediction_root, str(mask_id), "ground_truth")
-
-        all_metrics = {"ssim": [], "psnr": [], "mse": [], "mae": [], "lpips": []}
-
-        for item in test_files:
-            subject_id = item["subject_id"]
-
-            for mi in missing_idx:
-                mod_name = MODALITY_KEYS[mi]
-
-                pred_path = os.path.join(
-                    mask_pred_dir, subject_id, f"{subject_id}_{mod_name}.nii.gz"
-                )
-                gt_path = os.path.join(
-                    mask_gt_dir, subject_id, f"{subject_id}_{mod_name}.nii.gz"
-                )
-
-                if not os.path.exists(pred_path) or not os.path.exists(gt_path):
-                    continue
-
-                try:
-                    pred_nii = nib.load(pred_path)
-                    gt_nii = nib.load(gt_path)
-
-                    pred_data = pred_nii.get_fdata().astype(np.float32)
-                    gt_data = gt_nii.get_fdata().astype(np.float32)
-
-                    pred_data = (pred_data - pred_data.min()) / (
-                        pred_data.max() - pred_data.min() + 1e-8
-                    )
-                    pred_data = 2 * pred_data - 1
-                    gt_data = (gt_data - gt_data.min()) / (
-                        gt_data.max() - gt_data.min() + 1e-8
-                    )
-                    gt_data = 2 * gt_data - 1
-
-                    pred_tensor = torch.from_numpy(pred_data).unsqueeze(0).unsqueeze(0).to(device)
-                    gt_tensor = torch.from_numpy(gt_data).unsqueeze(0).unsqueeze(0).to(device)
-
-                    metrics = evaluator.evaluate_all_metrics(pred_tensor, gt_tensor)
-                    for k in all_metrics:
-                        all_metrics[k].append(metrics[k])
-                except Exception as e:
-                    print(f"  Warning: Error processing {subject_id}/{mod_name}: {e}")
-
-        avg_metrics = {
-            k: np.mean(v) if v else float("nan") for k, v in all_metrics.items()
-        }
-        avg_metrics["fid"] = -1.0
-
-        result_dir = os.path.join(metric_result_root, str(mask_id))
-        os.makedirs(result_dir, exist_ok=True)
-        result_path = os.path.join(result_dir, "result.txt")
-
-        table_head = "ssim     psnr     mse      mae      fid     lpips"
-        table = (
-            f"{avg_metrics['ssim']:.6f}   {avg_metrics['psnr']:.6f}  "
-            f"{avg_metrics['mse']:.6f}  {avg_metrics['mae']:.6f}  "
-            f"{avg_metrics['fid']:.6f}   {avg_metrics['lpips']:.6f}"
-        )
-
-        with open(result_path, "w") as f:
-            f.write(table_head + "\n")
-            f.write(table + "\n")
-
-        print(f"  Results: {table}")
-        print(f"  Saved to: {result_path}")
-
-
 def inference(args):
     """
-    Main entry point: either run inference (generate missing modalities for all
-    14 masks on all test samples) or --metrics_only (recompute metrics from
-    existing predictions).
+    Main inference: generate missing modalities for all 14 masks
+    on every test sample. Saves only synthetic images.
     """
     torch.set_grad_enabled(False)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # ---- Load test data (once, reused) ----
+    # ---- Load test data (test split only, never train/val) ----
     _, _, test_files = read_datalist(args.datalist_dir, args.data_root)
     print(f"Loaded {len(test_files)} test samples")
-
-    # ---- Output directories ----
-    prediction_root = os.path.join(args.task_dir, "prediction")
-    metric_result_root = os.path.join(args.task_dir, "prediction_metric_result")
-
-    # ---- Metrics-only mode ----
-    if args.metrics_only:
-        os.makedirs(metric_result_root, exist_ok=True)
-        compute_metrics(args, test_files, prediction_root, metric_result_root, device)
-        print("\n" + "=" * 60)
-        print("Metrics computation complete!")
-        print(f"Metrics: {metric_result_root}")
-        print("=" * 60)
-        return
-
-    # ---- Full inference mode ----
-    os.makedirs(prediction_root, exist_ok=True)
-    os.makedirs(metric_result_root, exist_ok=True)
 
     # ---- Load models ----
     print("Loading CoPeVAE model...")
@@ -256,7 +119,6 @@ def inference(args):
     if not os.path.exists(args.dit_ckpt):
         raise FileNotFoundError(f"MDiT3D checkpoint not found: {args.dit_ckpt}")
     dit_state = torch.load(args.dit_ckpt, map_location=device)
-    # Load EMA weights (preferred) or raw model weights
     if "ema" in dit_state:
         DiT.load_state_dict(dit_state["ema"])
         print("Loaded EMA weights")
@@ -269,50 +131,29 @@ def inference(args):
 
     # ---- Setup scheduler and inferer ----
     if args.noise_scheduler == "linear":
-        if args.pred_type == "noise":
-            scheduler_ddim = DDIMScheduler(
-                num_train_timesteps=args.sample_steps,
-                schedule="scaled_linear_beta",
-                beta_start=0.0015, beta_end=0.0195,
-                clip_sample=False,
-            )
-        elif args.pred_type == "x":
-            scheduler_ddim = DDIMScheduler(
-                num_train_timesteps=args.sample_steps,
-                schedule="scaled_linear_beta",
-                beta_start=0.0015, beta_end=0.0195,
-                clip_sample=False,
-                prediction_type=DDIMPredictionType.SAMPLE,
-            )
+        extra = {}
+        if args.pred_type == "x":
+            extra["prediction_type"] = DDIMPredictionType.SAMPLE
         elif args.pred_type == "v":
-            scheduler_ddim = DDIMScheduler(
-                num_train_timesteps=args.sample_steps,
-                schedule="scaled_linear_beta",
-                beta_start=0.0015, beta_end=0.0195,
-                clip_sample=False,
-                prediction_type=DDIMPredictionType.V_PREDICTION,
-            )
+            extra["prediction_type"] = DDIMPredictionType.V_PREDICTION
+        scheduler_ddim = DDIMScheduler(
+            num_train_timesteps=args.sample_steps,
+            schedule="scaled_linear_beta",
+            beta_start=0.0015, beta_end=0.0195,
+            clip_sample=False,
+            **extra,
+        )
     elif args.noise_scheduler == "cosine":
-        if args.pred_type == "noise":
-            scheduler_ddim = DDIMScheduler(
-                num_train_timesteps=args.sample_steps,
-                schedule="cosine", clip_sample=True,
-                clip_sample_min=0, clip_sample_max=1,
-            )
-        elif args.pred_type == "x":
-            scheduler_ddim = DDIMScheduler(
-                num_train_timesteps=args.sample_steps,
-                schedule="cosine", clip_sample=True,
-                clip_sample_min=0, clip_sample_max=1,
-                prediction_type=DDIMPredictionType.SAMPLE,
-            )
+        extra = {"clip_sample": True, "clip_sample_min": 0, "clip_sample_max": 1}
+        if args.pred_type == "x":
+            extra["prediction_type"] = DDIMPredictionType.SAMPLE
         elif args.pred_type == "v":
-            scheduler_ddim = DDIMScheduler(
-                num_train_timesteps=args.sample_steps,
-                schedule="cosine", clip_sample=True,
-                clip_sample_min=0, clip_sample_max=1,
-                prediction_type=DDIMPredictionType.V_PREDICTION,
-            )
+            extra["prediction_type"] = DDIMPredictionType.V_PREDICTION
+        scheduler_ddim = DDIMScheduler(
+            num_train_timesteps=args.sample_steps,
+            schedule="cosine",
+            **extra,
+        )
 
     scheduler_ddim.set_timesteps(num_inference_steps=args.sample_steps)
     scale_factor = 1.0
@@ -322,20 +163,27 @@ def inference(args):
 
     eval_transform = get_eval_transforms(args)
 
-    # ---- Generate for each test sample and each mask ----
+    # ---- Output directory ----
+    prediction_root = os.path.join(args.task_dir, "prediction")
+    os.makedirs(prediction_root, exist_ok=True)
+
+    total_tasks = len(test_files) * len(MASK_LIST)
+    print(f"Starting inference: {len(test_files)} patients × {len(MASK_LIST)} masks = {total_tasks} generations")
+
+    # ---- Generate for each test sample × each mask ----
     start = timeit.default_timer()
 
-    for sample_idx, item in enumerate(tqdm(test_files, desc="Processing samples")):
+    for sample_idx, item in enumerate(tqdm(test_files, desc="Patients")):
         subject_id = item["subject_id"]
 
-        # Load and preprocess all 4 modalities (batch_size=1: one sample at a time)
+        # Load and preprocess all 4 modalities (batch_size=1)
         try:
             data = eval_transform(item)
         except Exception as e:
             print(f"Warning: Failed to load {subject_id}: {e}")
             continue
 
-        # Read affine from original NIfTI for saving
+        # Read affine from original NIfTI for output
         ref_path = item[MODALITY_KEYS[0]]
         ref_img = nib.load(ref_path)
         affine = ref_img.affine
@@ -346,29 +194,25 @@ def inference(args):
         )  # [1, 4, H, W, D]
 
         # Process all 14 masks
-        for mask_idx, mask in enumerate(MASK_LIST):
-            mask_id = mask_idx + 1
+        for mask in MASK_LIST:
             mask_str = mask_to_string(mask)
 
             available_idx = [i for i, m in enumerate(mask) if m == 1]
             missing_idx = [i for i, m in enumerate(mask) if m == 0]
 
             if len(available_idx) == 0 or len(missing_idx) == 0:
-                continue  # Should not happen with our mask list
+                continue  # Should not happen
 
             x_available = full_img[:, available_idx, ...].to(device)
-            x_missing_gt = full_img[:, missing_idx, ...].to(device)
 
-            # Create noise for missing modalities
             with autocast(enabled=True):
                 # Encode available modalities to get latent shape
                 latent_avail = autoencoder.encode_stage_2_inputs(
                     x_available
                 ) * scale_factor
-                # latent_avail: [1, N_avail, latent_dim=8, h, w, d]
                 _, _, latent_dim, h_lat, w_lat, d_lat = latent_avail.shape
 
-                # Noise shape must match: [B, N_miss, latent_dim, h, w, d]
+                # Noise for missing modalities [B, N_miss, latent_dim, h, w, d]
                 noise = torch.randn(
                     (1, len(missing_idx), latent_dim, h_lat, w_lat, d_lat),
                     device=device
@@ -387,59 +231,28 @@ def inference(args):
                 )
                 # generated: [1, N_miss, H, W, D]
 
-            # ---- Save outputs ----
-            mask_pred_dir = os.path.join(
-                prediction_root, str(mask_id), "prediction", subject_id
-            )
-            mask_input_dir = os.path.join(
-                prediction_root, str(mask_id), "input", subject_id
-            )
-            mask_gt_dir = os.path.join(
-                prediction_root, str(mask_id), "ground_truth", subject_id
-            )
-
+            # Save ONLY synthetic (missing) images — no GT, no input
+            out_dir = os.path.join(prediction_root, mask_str, subject_id)
             for mi_idx, mi in enumerate(missing_idx):
                 mod_name = MODALITY_KEYS[mi]
                 gen_data = generated[0, mi_idx, ...]
                 save_nifti(
                     gen_data, affine,
-                    os.path.join(mask_pred_dir, f"{subject_id}_{mod_name}.nii.gz"),
-                )
-
-            for mi_idx, mi in enumerate(missing_idx):
-                mod_name = MODALITY_KEYS[mi]
-                gt_data = x_missing_gt[0, mi_idx, ...]
-                save_nifti(
-                    gt_data, affine,
-                    os.path.join(mask_gt_dir, f"{subject_id}_{mod_name}.nii.gz"),
-                )
-
-            for ai_idx, ai in enumerate(available_idx):
-                mod_name = MODALITY_KEYS[ai]
-                in_data = x_available[0, ai_idx, ...]
-                save_nifti(
-                    in_data, affine,
-                    os.path.join(mask_input_dir, f"{subject_id}_{mod_name}.nii.gz"),
+                    os.path.join(out_dir, f"{subject_id}_{mod_name}.nii.gz"),
                 )
 
             torch.cuda.empty_cache()
 
     end = timeit.default_timer()
     elapsed = end - start
-    print(f"\nInference completed in {elapsed:.1f}s")
-
-    # ---- Compute metrics from saved predictions ----
-    compute_metrics(args, test_files, prediction_root, metric_result_root, device)
-
-    print("\n" + "=" * 60)
-    print("Evaluation complete!")
-    print(f"Predictions:  {prediction_root}")
-    print(f"Metrics:      {metric_result_root}")
-    print("=" * 60)
+    print(f"\nInference completed in {elapsed:.1f}s ({elapsed/3600:.1f}h)")
+    print(f"Output: {prediction_root}/")
+    print("\nNext: use global eval script to compute metrics, e.g.:")
+    print(f"  python syn_metric.py --pred_path {prediction_root}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CoPeDiT Evaluation on BraTS2020")
+    parser = argparse.ArgumentParser(description="CoPeDiT Inference on BraTS2020 Test Set")
 
     parser.add_argument(
         "--ae_ckpt", required=True, type=str,
@@ -464,43 +277,16 @@ if __name__ == "__main__":
         "--datalist_dir",
         default=os.environ.get(
             "DATALIST_DIR",
-            os.path.join(
-                os.environ.get(
-                    "COMPARE_ROOT",
-                    os.path.dirname(os.path.abspath(__file__)),
-                ),
-                "datalist/BraTS2020",
-            ),
+            os.path.join(PROJ_ROOT, "datalist/BraTS2020"),
         ),
         type=str, help="Directory containing test.list (env: DATALIST_DIR)",
-    )
-    parser.add_argument(
-        "--eval_script",
-        default=os.environ.get(
-            "EVAL_SCRIPT",
-            "/devdata2/hsh/program/python/methods/MySparseDiffusion/"
-            "my_sparse_diff-moe-006/scripts/_01_vae/metrics/syn_metrics.py",
-        ),
-        type=str, help="Path to syn_metrics.py (env: EVAL_SCRIPT)",
     )
 
     parser.add_argument(
         "--task_dir",
         default=None,
         type=str,
-        help="Task directory for outputs (default: $COMPARE_ROOT/results/task_{timestamp})",
-    )
-    parser.add_argument(
-        "--batch_size",
-        default=1,
-        type=int,
-        help="Inference batch size (fixed at 1 for per-sample generation)",
-    )
-    parser.add_argument(
-        "--metrics_only",
-        default=False,
-        action="store_true",
-        help="Skip inference, only re-compute metrics from existing predictions",
+        help="Output directory (default: $COMPARE_ROOT/results/task_{timestamp})",
     )
 
     parser.add_argument("--DiT", default="MDiT3D-B/2", type=str)
@@ -544,7 +330,7 @@ if __name__ == "__main__":
 
     if args.task_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.task_dir = os.path.join(PROJ_ROOT, f"results/task_{timestamp}")
+        args.task_dir = os.path.join(PROJ_ROOT, "results", f"task_{timestamp}")
 
     os.makedirs(args.task_dir, exist_ok=True)
     print(f"Task directory: {args.task_dir}")
