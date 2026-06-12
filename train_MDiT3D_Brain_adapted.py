@@ -1,19 +1,22 @@
 #!/usr/bin/env python
 """
-Adapted MDiT3D (Stage 2) Training Script for BraTS2020.
-Changes from original:
-- Uses data/BraTS2020_data.py for MONAI-based BraTS2020 data loading
-- TensorBoard logging for epoch loss/lr
-- Model checkpoints saved to results/task_{timestamp}/models/
-- Single GPU mode by default, 200 epochs
-Requires: Pre-trained CoPeVAE checkpoint from Stage 1.
-Original code: train_MDiT3D_Brain.py
+MDiT3D (Stage 2) Training Script for BraTS2020 — Rule-compliant.
+
+Rules satisfied:
+  Rule 0  — Global path variables (COMPARE_ROOT/DATA_ROOT/DATALIST_DIR)
+  Rule 1  — Train never loads test data (read_train_val_datalist)
+  Rule 7a — Output dirs: models/, tensorboard/, logs/
+  Rule 8  — Log format: per-step every log_interval + epoch-end summary
+  Rule 9  — Checkpoints: 0.pt, latest.pt, checkpoint_epoch_N.pt, final_model.pt
 """
 
-import argparse, os, timeit, logging, sys
+import argparse
+import os
+import sys
+import timeit
+import logging
 from copy import deepcopy
 from datetime import datetime
-from time import time
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -21,7 +24,6 @@ import torch.optim as optim
 from tqdm import tqdm
 from collections import OrderedDict
 from torch.nn.parallel import DistributedDataParallel
-import torch.multiprocessing as mp
 from torch.nn import L1Loss, MSELoss
 from timm.scheduler.cosine_lr import CosineLRScheduler
 from monai.utils import first
@@ -34,397 +36,408 @@ from AutoEncoder.model.CoPeVAE_BrainMRI import CopeVAE
 from LDM.model.MDiT3D_Brain import *
 from LDM.inferers import inferer_DiT_Brain
 from LDM.utils import *
-from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
+from generative.networks.schedulers import DDPMScheduler
 from data.BraTS2020_data import (
     MODALITY_KEYS, read_train_val_datalist, get_transforms, get_loader_MDiT3D,
 )
 
 
+def setup_logger(task_dir):
+    """Setup logging to BOTH console and logs/train.log (Rule 8)."""
+    log_dir = os.path.join(task_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    logger = logging.getLogger("MDiT3D")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("[%(asctime)s][%(levelname)s] %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+
+    fh = logging.FileHandler(os.path.join(log_dir, "train.log"))
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    return logger
+
+
+def save_checkpoint(path, epoch, global_step, model, ema_model,
+                    optimizer, scheduler, epoch_loss, lr, args):
+    """Save checkpoint in Rule 9 format."""
+    torch.save({
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state_dict": model.state_dict(),
+        "ema_state_dict": ema_model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "epoch_loss": epoch_loss,
+        "lr": lr,
+        "args": args,
+    }, path)
+
+
+def load_ae_ckpt(autoencoder, ckpt_path, device):
+    """Load CoPeVAE checkpoint supporting both old and new Rule 9 format."""
+    state = torch.load(str(ckpt_path), map_location=device)
+    if "model_state_dict" in state:
+        autoencoder.load_state_dict(state["model_state_dict"])
+        print(f"Loaded AE via model_state_dict (Rule 9 format)")
+    elif "model" in state:
+        autoencoder.load_state_dict(state["model"])
+        print(f"Loaded AE via model (legacy format)")
+    else:
+        raise KeyError(f"AE checkpoint has neither 'model_state_dict' nor 'model' key. "
+                       f"Keys: {list(state.keys())}")
+    return state.get("epoch", "?")
+
+
 def train(args, autoencoder, DiT):
     """Main training loop for MDiT3D Stage 2."""
-    if args.rank == 0:
-        logger = create_logger(args.log_dir, args.distributed)
-    else:
-        logger = create_logger(args.log_dir, args.distributed)
-    if args.rank == 0:
-        writer = SummaryWriter(log_dir=args.tb_log_dir)
-        logger.info(f"TensorBoard log directory: {args.tb_log_dir}")
-    else:
-        writer = None
-    train_files, val_files = read_train_val_datalist(
-        args.datalist_dir, args.data_root
-    )
-    logger.info(
-        f"Loaded {len(train_files)} train, {len(val_files)} val samples "
-        f"(test data NOT loaded — use eval.py for test)"
-    )
-    train_transform, test_transform = get_transforms(
-        args, MODALITY_KEYS, is_train=True
-    )
+
+    # ---- Logger (Rule 8: console + file) ----
+    logger = setup_logger(args.task_dir)
+
+    # ---- TensorBoard ----
+    writer = SummaryWriter(log_dir=os.path.join(args.task_dir, "tensorboard"))
+    logger.info(f"TensorBoard: {args.task_dir}/tensorboard")
+
+    # ---- Load data (Rule 1: train+val only, never test) ----
+    logger.info(f"Data root: {args.data_root}")
+    logger.info(f"Datalist dir: {args.datalist_dir}")
+    train_files, val_files = read_train_val_datalist(args.datalist_dir, args.data_root)
+    logger.info(f"Loaded {len(train_files)} train, {len(val_files)} val "
+                f"(test data NOT loaded — use eval.py for test)")
+
+    train_transform, _ = get_transforms(args, MODALITY_KEYS, is_train=True)
     _, val_transform = get_transforms(args, MODALITY_KEYS, is_train=False)
-    dataloader_train, dataloader_test, train_sampler, test_sampler = (
-        get_loader_MDiT3D(
-            args, args.rank, args.world_size,
-            train_files, val_files,
-            train_transform, val_transform,
-        )
+    dataloader_train, dataloader_val, train_sampler, val_sampler = (
+        get_loader_MDiT3D(args, args.rank, args.world_size,
+                          train_files, val_files,
+                          train_transform, val_transform)
     )
-    if args.diff_loss == "l2":
-        diff_loss = MSELoss()
-        if args.rank == 0:
-            print("Use l2 loss")
-    else:
-        diff_loss = L1Loss(reduction="mean")
-        if args.rank == 0:
-            print("Use l1 loss")
-    accumulation_steps = args.gradient_accumulation_steps
+    logger.info(f"Train batches/epoch: {len(dataloader_train)}")
+
+    # ---- Loss ----
+    diff_loss_fn = MSELoss() if args.diff_loss == "l2" else L1Loss(reduction="mean")
+    logger.info(f"Diffusion loss: {args.diff_loss}, pred_type: {args.pred_type}")
+
+    # ---- DDPM scheduler ----
     if args.noise_scheduler == "linear":
         scheduler_ddpm = DDPMScheduler(
             num_train_timesteps=args.diffusion_steps,
             schedule="scaled_linear_beta",
-            beta_start=0.0015, beta_end=0.0195,
-            clip_sample=False,
-        )
-    elif args.noise_scheduler == "cosine":
+            beta_start=0.0015, beta_end=0.0195, clip_sample=False)
+    else:
         scheduler_ddpm = DDPMScheduler(
             num_train_timesteps=args.diffusion_steps,
-            schedule="cosine", clip_sample=False,
-        )
+            schedule="cosine", clip_sample=False)
+
+    accumulation_steps = args.gradient_accumulation_steps
+
+    # ---- EMA model ----
     ema = deepcopy(DiT).to(args.device)
     requires_grad(ema, False)
     DiT = DiT.to(args.device)
+
+    # ---- Load frozen CoPeVAE ----
     autoencoder = autoencoder.to(args.device)
-    if args.ae_ckpt is not None and os.path.exists(args.ae_ckpt):
-        state_dict = torch.load(str(args.ae_ckpt), map_location=args.device)
-        autoencoder.load_state_dict(state_dict["model"])
-        if args.rank == 0:
-            print(f"AE checkpoint loaded from {args.ae_ckpt}")
+    if args.ae_ckpt and os.path.exists(args.ae_ckpt):
+        ae_epoch = load_ae_ckpt(autoencoder, args.ae_ckpt, args.device)
+        logger.info(f"CoPeVAE loaded from {args.ae_ckpt} (epoch {ae_epoch})")
     else:
-        if args.rank == 0:
-            print(
-                f"WARNING: AE checkpoint not found at {args.ae_ckpt}. "
-                "Training with randomly initialized autoencoder!"
-            )
+        logger.warning(f"AE checkpoint not found at {args.ae_ckpt}")
+
     autoencoder.eval()
     autoencoder.requires_grad_(False)
+
+    # ---- Scale factor from first batch ----
     check_data = first(dataloader_train)
-    with torch.no_grad():
-        with autocast(enabled=True):
-            z0 = autoencoder.encode_stage_2_inputs(
-                check_data[0].to(args.device)
-            )
-            z1 = autoencoder.encode_stage_2_inputs(
-                check_data[1].to(args.device)
-            )
+    with torch.no_grad(), autocast(enabled=True):
+        z0 = autoencoder.encode_stage_2_inputs(check_data[0].to(args.device))
+        z1 = autoencoder.encode_stage_2_inputs(check_data[1].to(args.device))
     scale_factor = 1.0
-    print(f"scale_factor -> {scale_factor}.")
+    logger.info(f"Latent scale factor: {scale_factor}")
     torch.cuda.empty_cache()
-    inferer = inferer_DiT_Brain.LatentDiffusionInferer(
-        scheduler_ddpm, scale_factor=scale_factor
-    )
-    logger.info(
-        f"AE Parameters: {sum(p.numel() for p in autoencoder.parameters()):,}"
-    )
-    logger.info(
-        f"DiT Parameters: {sum(p.numel() for p in DiT.parameters()):,}"
-    )
-    if args.opt == "adam":
-        optimizer = optim.Adam(params=DiT.parameters(), lr=args.lr)
-    elif args.opt == "adamw":
-        optimizer = optim.AdamW(
-            params=DiT.parameters(), lr=args.lr, weight_decay=args.decay
-        )
-    elif args.opt == "sgd":
-        optimizer = optim.SGD(
-            params=DiT.parameters(), lr=args.lr,
-            momentum=args.momentum, weight_decay=args.decay,
-        )
+
+    inferer = inferer_DiT_Brain.LatentDiffusionInferer(scheduler_ddpm, scale_factor=scale_factor)
+
+    # ---- Optimizer ----
+    if args.opt == "sgd":
+        optimizer = optim.SGD(DiT.parameters(), lr=args.lr,
+                              momentum=args.momentum, weight_decay=args.decay)
+    elif args.opt == "adam":
+        optimizer = optim.Adam(DiT.parameters(), lr=args.lr)
+    else:
+        optimizer = optim.AdamW(DiT.parameters(), lr=args.lr, weight_decay=args.decay)
+    logger.info(f"Optimizer: {args.opt}, lr={args.lr}")
+
+    # ---- Scheduler ----
+    scheduler = None
     if args.lr_schedule == "warmup_cosine":
         scheduler = CosineLRScheduler(
             optimizer, warmup_t=args.warmup_steps, warmup_lr_init=1e-6,
-            t_initial=args.num_steps, lr_min=args.lr_min, cycle_limit=1,
-        )
+            t_initial=args.num_steps, lr_min=args.lr_min, cycle_limit=1)
     elif args.lr_schedule == "poly":
-        def lambdas(epoch):
-            return (1 - float(epoch) / float(args.epochs)) ** 0.9
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lambda=lambdas
-        )
-    if args.amp:
-        scaler = GradScaler()
+        def lambdas(e):
+            return (1 - float(e) / float(args.epochs)) ** 0.9
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
+
+    scaler = GradScaler() if args.amp else None
+
+    logger.info(f"AE params: {sum(p.numel() for p in autoencoder.parameters()):,}")
+    logger.info(f"DiT params: {sum(p.numel() for p in DiT.parameters()):,}")
+
+    # ---- Setup ----
     DiT.train()
     ema.eval()
-    val_interval = args.val_interval
-    start_epoch = 0
-    max_epochs = args.epochs
-    global_step = 0
-    total_steps_per_epoch = len(dataloader_train)
-    start = timeit.default_timer()
+
     if args.distributed:
         DiT = DistributedDataParallel(DiT, device_ids=[args.rank])
-    if args.resume_ckpt is not None and os.path.exists(args.resume_ckpt):
+
+    # Resume support
+    start_epoch = 0
+    if args.resume_ckpt and os.path.exists(args.resume_ckpt):
         ckpt = torch.load(str(args.resume_ckpt), map_location="cpu")
         if args.distributed:
-            DiT.module.load_state_dict(ckpt["model"])
+            DiT.module.load_state_dict(ckpt["model_state_dict"])
         else:
-            DiT.load_state_dict(ckpt["model"])
-        ema.load_state_dict(ckpt["ema"])
+            DiT.load_state_dict(ckpt["model_state_dict"])
+        ema.load_state_dict(ckpt["ema_state_dict"])
         start_epoch = ckpt["epoch"]
-        logger.info(f"Resuming training from checkpoint, epoch: {start_epoch}")
-    if args.resume_ckpt is None:
+        logger.info(f"Resumed from {args.resume_ckpt}, epoch={start_epoch}")
+    else:
         if args.distributed:
             update_ema(ema, DiT.module, decay=0)
         else:
             update_ema(ema, DiT, decay=0)
+
+    max_epochs = args.epochs
+    total_steps_per_epoch = len(dataloader_train)
+    total_global_steps = max_epochs * total_steps_per_epoch
+    global_step = start_epoch * total_steps_per_epoch
+    start_time = timeit.default_timer()
+
+    # ---- Rule 9: save 0.pt before training ----
+    save_checkpoint(
+        os.path.join(args.task_dir, "models", "0.pt"),
+        0, global_step, DiT, ema, optimizer, scheduler,
+        float("nan"), args.lr, args)
+    logger.info("Saved 0.pt (initial weights)")
+
+    logger.info(f"Start training: {max_epochs} epochs, "
+                f"{total_steps_per_epoch} steps/epoch, "
+                f"{total_global_steps} total steps")
+
+    # ---- Training loop ----
     for epoch in range(start_epoch, max_epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-            test_sampler.set_epoch(epoch)
+            val_sampler.set_epoch(epoch)
+
         DiT.train()
-        train_epoch_losses = {"diff_loss": 0}
-        progress_bar = tqdm(
-            enumerate(dataloader_train), total=total_steps_per_epoch, ncols=160
-        )
-        progress_bar.set_description(f"Epoch {epoch}/{max_epochs}")
+        epoch_loss_sum = 0.0
+
+        progress_bar = tqdm(enumerate(dataloader_train),
+                            total=total_steps_per_epoch, ncols=130)
+        progress_bar.set_description(f"Epoch {epoch+1}/{max_epochs}")
+
         for i, batch in progress_bar:
             global_step += 1
-            progress_bar.set_postfix({"G": global_step})
             x_available, x_missing, missing_condition = batch
             x_available = x_available.to(args.device)
             x_missing = x_missing.to(args.device)
             missing_condition = missing_condition.to(args.device)
-            with torch.no_grad():
-                with autocast(enabled=args.amp):
-                    prompts = autoencoder.get_condition(x_available)
+
+            with torch.no_grad(), autocast(enabled=args.amp):
+                prompts = autoencoder.get_condition(x_available)
+
             with autocast(enabled=args.amp):
                 noise, noise_missing = get_noise(z0, z1)
                 noise = noise.to(args.device)
                 noise_missing = noise_missing.to(args.device)
                 timesteps = torch.randint(
                     0, inferer.scheduler.num_train_timesteps,
-                    (x_available.shape[0],), device=x_available.device,
-                ).long()
+                    (x_available.shape[0],), device=x_available.device).long()
+
                 pred, latent = inferer(
                     inputs=[x_available, x_missing],
                     autoencoder_model=autoencoder,
-                    diffusion_model=DiT,
-                    noise=noise_missing,
-                    timesteps=timesteps,
-                    condition=prompts,
-                )
+                    diffusion_model=DiT, noise=noise_missing,
+                    timesteps=timesteps, condition=prompts)
+
                 if args.pred_type == "noise":
-                    l_diff = diff_loss(pred, noise_missing)
+                    l_diff = diff_loss_fn(pred, noise_missing)
                 elif args.pred_type == "x":
-                    l_diff = diff_loss(pred, latent)
+                    l_diff = diff_loss_fn(pred, latent)
                 elif args.pred_type == "v":
                     v = scheduler_ddpm.get_velocity(latent, noise, timesteps)
-                    l_diff = diff_loss(pred, v)
+                    l_diff = diff_loss_fn(pred, v)
+
                 l_diff = l_diff / accumulation_steps
-                losses = {"diff_loss": l_diff * accumulation_steps}
-            for loss_name, loss_value in losses.items():
-                train_epoch_losses[loss_name] += loss_value.item()
+
+            epoch_loss_sum += l_diff.item() * accumulation_steps
+
+            # ---- Backward ----
             if args.amp:
                 scaler.scale(l_diff).backward()
                 if (i + 1) % accumulation_steps == 0:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        DiT.parameters(), max_norm=1.0
-                    )
+                    torch.nn.utils.clip_grad_norm_(DiT.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
             else:
                 l_diff.backward()
                 if (i + 1) % accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        DiT.parameters(), max_norm=1.0
-                    )
+                    torch.nn.utils.clip_grad_norm_(DiT.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+
+            # ---- EMA update ----
             if args.distributed:
                 update_ema(ema, DiT.module)
             else:
                 update_ema(ema, DiT)
-        if args.lrdecay:
+
+            # ---- Rule 8: per-step log every log_interval ----
+            if global_step % args.log_interval == 0:
+                current_lr = (scheduler._get_lr(epoch)[0] if scheduler
+                              and args.lr_schedule == "warmup_cosine"
+                              else scheduler.get_last_lr()[0] if scheduler
+                              else optimizer.param_groups[0]["lr"])
+                logger.info(
+                    f"Epoch {epoch+1}/{max_epochs} | "
+                    f"Step {i+1}/{total_steps_per_epoch} "
+                    f"[global {global_step}/{total_global_steps}] | "
+                    f"Loss: {l_diff.item() * accumulation_steps:.6f} | "
+                    f"LR: {current_lr:.2e}"
+                )
+
+        # ---- End of epoch ----
+        if scheduler and args.lrdecay:
             scheduler.step(epoch)
-        for key in train_epoch_losses:
-            train_epoch_losses[key] /= len(dataloader_train)
-        diff_loss_epoch = train_epoch_losses["diff_loss"]
-        end = timeit.default_timer()
-        elapsed = end - start
+
+        avg_epoch_loss = epoch_loss_sum / total_steps_per_epoch
         if args.lr_schedule == "warmup_cosine":
             current_lr = scheduler._get_lr(epoch)[0]
         else:
-            current_lr = scheduler.get_last_lr()[0]
-        if args.rank == 0 and writer is not None:
-            writer.add_scalar("Loss/train_diff", diff_loss_epoch, epoch)
-            writer.add_scalar("LR/lr", current_lr, epoch)
-        if args.rank == 0:
-            print(
-                "[Train Epoch: %d/%d][G: %d][Time: %d][L: %.4f][lr: %.6f]"
-                % (epoch, max_epochs, global_step, elapsed, diff_loss_epoch, current_lr)
-            )
-        logger.info(
-            "[Train Epoch: %d/%d][G: %d][Time: %d][L: %.4f][lr: %.6f]"
-            % (epoch, max_epochs, global_step, elapsed, diff_loss_epoch, current_lr)
-        )
-        if args.distributed:
-            if args.rank == 0:
-                checkpoint = {
-                    "model": DiT.module.state_dict(),
-                    "ema": ema.state_dict(),
-                    "args": args, "epoch": epoch,
-                }
-                checkpoint_path = os.path.join(args.model_dir, "DiT.pt")
-                torch.save(checkpoint, checkpoint_path)
-        else:
-            checkpoint = {
-                "model": DiT.state_dict(),
-                "ema": ema.state_dict(),
-                "args": args, "epoch": epoch,
-            }
-            checkpoint_path = os.path.join(args.model_dir, "DiT.pt")
-            torch.save(checkpoint, checkpoint_path)
-        if epoch % args.ckpt_interval == 0 and epoch > 0:
-            if args.distributed:
-                if args.rank == 0:
-                    checkpoint = {
-                        "model": DiT.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "args": args, "epoch": epoch,
-                    }
-                    checkpoint_path = os.path.join(
-                        args.model_dir, f"DiT_epoch{epoch}.pt"
-                    )
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-            else:
-                checkpoint = {
-                    "model": DiT.state_dict(),
-                    "ema": ema.state_dict(),
-                    "args": args, "epoch": epoch,
-                }
-                checkpoint_path = os.path.join(
-                    args.model_dir, f"DiT_epoch{epoch}.pt"
-                )
-                torch.save(checkpoint, checkpoint_path)
-                logger.info(f"Saved checkpoint to {checkpoint_path}")
-        if epoch % val_interval == 0 and epoch > 0:
+            current_lr = (scheduler.get_last_lr()[0] if scheduler
+                          else optimizer.param_groups[0]["lr"])
+        elapsed = timeit.default_timer() - start_time
+
+        # ---- Rule 8: epoch-end summary ----
+        logger.info(f"Epoch [{epoch+1}/{max_epochs}] | "
+                    f"Loss: {avg_epoch_loss:.6f} | "
+                    f"LR: {current_lr:.2e} | "
+                    f"Time: {elapsed:.1f}s")
+
+        # ---- TensorBoard ----
+        writer.add_scalar("Loss/train_diff", avg_epoch_loss, epoch + 1)
+        writer.add_scalar("LR/lr", current_lr, epoch + 1)
+
+        # ---- Rule 9: save latest.pt (every epoch, overwrites) ----
+        save_checkpoint(
+            os.path.join(args.task_dir, "models", "latest.pt"),
+            epoch + 1, global_step, DiT, ema, optimizer, scheduler,
+            avg_epoch_loss, current_lr, args)
+
+        # ---- Rule 9: checkpoint_epoch_N.pt (milestone) ----
+        if (epoch + 1) % args.ckpt_interval == 0:
+            save_checkpoint(
+                os.path.join(args.task_dir, "models",
+                             f"checkpoint_epoch_{epoch+1}.pt"),
+                epoch + 1, global_step, DiT, ema, optimizer, scheduler,
+                avg_epoch_loss, current_lr, args)
+            logger.info(f"Saved checkpoint_epoch_{epoch+1}.pt")
+
+        # ---- Validation ----
+        if (epoch + 1) % val_interval == 0 and epoch > 0:
             DiT.eval()
             val_epoch_losses = {"diff_loss": 0}
-            for batch in dataloader_test:
-                with torch.no_grad():
-                    with autocast(enabled=args.amp):
-                        x_available, x_missing, missing_condition = batch
-                        x_available = x_available.to(args.device)
-                        x_missing = x_missing.to(args.device)
-                        missing_condition = missing_condition.to(args.device)
-                        prompts = autoencoder.get_condition(x_available)
-                        noise, noise_missing = get_noise(z0, z1)
-                        noise = noise.to(args.device)
-                        noise_missing = noise_missing.to(args.device)
-                        timesteps = torch.randint(
-                            0, inferer.scheduler.num_train_timesteps,
-                            (x_available.shape[0],),
-                            device=x_available.device,
-                        ).long()
-                        pred, latent = inferer(
-                            inputs=[x_available, x_missing],
-                            autoencoder_model=autoencoder,
-                            diffusion_model=DiT,
-                            noise=noise_missing,
-                            timesteps=timesteps,
-                            condition=prompts,
-                        )
-                        if args.pred_type == "noise":
-                            l_diff = diff_loss(pred, noise_missing)
-                        elif args.pred_type == "x":
-                            l_diff = diff_loss(pred, latent)
-                        elif args.pred_type == "v":
-                            v = scheduler_ddpm.get_velocity(
-                                latent, noise, timesteps
-                            )
-                            l_diff = diff_loss(pred, v)
-                        losses = {"diff_loss": l_diff}
-                    for loss_name, loss_value in losses.items():
-                        val_epoch_losses[loss_name] += loss_value.item()
-            for key in val_epoch_losses:
-                val_epoch_losses[key] /= len(dataloader_test)
-            val_diff_loss = val_epoch_losses["diff_loss"]
-            end_val = timeit.default_timer()
-            time_val = end_val - start
-            if args.rank == 0 and writer is not None:
-                writer.add_scalar("Loss/val_diff", val_diff_loss, epoch)
-            if args.rank == 0:
-                print(
-                    "[Val Epoch: %d][Time: %d][L: %.4f]"
-                    % (epoch, time_val, val_diff_loss)
-                )
-            logger.info(
-                "[Val Epoch: %d][Time: %d][L: %.4f]"
-                % (epoch, time_val, val_diff_loss)
-            )
-    if args.rank == 0 and writer is not None:
-        writer.close()
+            for batch in dataloader_val:
+                with torch.no_grad(), autocast(enabled=args.amp):
+                    x_available, x_missing, missing_condition = batch
+                    x_available = x_available.to(args.device)
+                    x_missing = x_missing.to(args.device)
+                    missing_condition = missing_condition.to(args.device)
+                    prompts = autoencoder.get_condition(x_available)
+                    noise, noise_missing = get_noise(z0, z1)
+                    noise = noise.to(args.device)
+                    noise_missing = noise_missing.to(args.device)
+                    timesteps = torch.randint(
+                        0, inferer.scheduler.num_train_timesteps,
+                        (x_available.shape[0],), device=x_available.device).long()
+                    pred, latent = inferer(
+                        inputs=[x_available, x_missing],
+                        autoencoder_model=autoencoder, diffusion_model=DiT,
+                        noise=noise_missing, timesteps=timesteps,
+                        condition=prompts)
+                    if args.pred_type == "noise":
+                        l = diff_loss_fn(pred, noise_missing)
+                    elif args.pred_type == "x":
+                        l = diff_loss_fn(pred, latent)
+                    else:
+                        l = diff_loss_fn(pred,
+                                         scheduler_ddpm.get_velocity(latent, noise, timesteps))
+                    val_epoch_losses["diff_loss"] += l.item()
+
+            val_diff = val_epoch_losses["diff_loss"] / len(dataloader_val)
+            writer.add_scalar("Loss/val_diff", val_diff, epoch + 1)
+            logger.info(f"Val [{epoch+1}/{max_epochs}] | Loss: {val_diff:.6f}")
+
+    # ---- Rule 9: final_model.pt ----
+    save_checkpoint(
+        os.path.join(args.task_dir, "models", "final_model.pt"),
+        max_epochs, global_step, DiT, ema, optimizer, scheduler,
+        avg_epoch_loss, current_lr, args)
+    logger.info("Saved final_model.pt")
+
+    writer.close()
+    logger.info(f"Training complete. Total time: {timeit.default_timer() - start_time:.1f}s")
     if args.distributed:
         cleanup()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MDiT3D Stage 2 Training (Adapted)")
-    parser.add_argument(
-        "--data_root",
-        default=os.environ.get(
-            "DATA_ROOT",
-            "/devdata/hsh/datasets/seg_dataset/BraTS2020/"
-            "brats20-dataset-training-validation/versions/1/"
-            "BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData",
-        ),
-        type=str, help="Root path to BraTS2020 TrainingData (env: DATA_ROOT)",
-    )
-    parser.add_argument(
-        "--datalist_dir",
-        default=os.environ.get(
-            "DATALIST_DIR",
-            os.path.join(
-                os.environ.get(
-                    "COMPARE_ROOT",
-                    os.path.dirname(os.path.abspath(__file__)),
-                ),
-                "datalist/BraTS2020",
-            ),
-        ),
-        type=str, help="Directory containing train.list, val.list (env: DATALIST_DIR)",
-    )
-    parser.add_argument(
-        "--ae_ckpt", default=None, type=str,
-        help="Path to pre-trained CoPeVAE checkpoint (required for Stage 2)",
-    )
-    parser.add_argument("--dataset", default="BraTS", type=str)
-    parser.add_argument(
-        "--missing_num", default=1, type=int,
-        help="number of missing modalities (1, 2, or 3)",
-        choices=[1, 2, 3],
-    )
-    parser.add_argument(
-        "--epochs", default=200, type=int,
-        help="number of training epochs (default: 200)",
-    )
+    parser = argparse.ArgumentParser(description="MDiT3D Stage 2 Training (Rule-compliant)")
+    parser.add_argument("--data_root",
+                        default=os.environ.get(
+                            "DATA_ROOT",
+                            "/devdata/hsh/datasets/seg_dataset/BraTS2020/"
+                            "brats20-dataset-training-validation/versions/1/"
+                            "BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData"),
+                        type=str, help="Root path to BraTS2020 TrainingData (env: DATA_ROOT)")
+    parser.add_argument("--datalist_dir",
+                        default=os.environ.get(
+                            "DATALIST_DIR",
+                            os.path.join(os.environ.get(
+                                "COMPARE_ROOT",
+                                os.path.dirname(os.path.abspath(__file__))),
+                                "datalist/BraTS2020")),
+                        type=str, help="Directory with train.list, val.list (env: DATALIST_DIR)")
+    parser.add_argument("--ae_ckpt", default=None, type=str,
+                        help="Path to pre-trained CoPeVAE checkpoint")
+    parser.add_argument("--epochs", default=200, type=int)
     parser.add_argument("--num_steps", default=8000, type=int)
     parser.add_argument("--warmup_steps", default=50, type=int)
-    parser.add_argument(
-        "--batch_size", default=2, type=int,
-        help="batch size (default: 2; reduce to 1 if OOM)",
-    )
-    parser.add_argument("--lr", default=5e-5, type=float, help="learning rate")
-    parser.add_argument("--lrdecay", default=True, help="enable LR decay")
+    parser.add_argument("--batch_size", default=2, type=int)
+    parser.add_argument("--lr", default=5e-5, type=float)
+    parser.add_argument("--lrdecay", default=True)
     parser.add_argument("--decay", default=0, type=float)
     parser.add_argument("--momentum", default=0.9, type=float)
     parser.add_argument("--lr_schedule", default="warmup_cosine", type=str)
     parser.add_argument("--lr_min", default=2e-5, type=float)
     parser.add_argument("--opt", default="adamw", type=str)
     parser.add_argument("--val_interval", default=20, type=int)
-    parser.add_argument("--ckpt_interval", default=50, type=int)
+    parser.add_argument("--ckpt_interval", default=20, type=int)
+    parser.add_argument("--log_interval", default=10, type=int,
+                        help="Log every N steps (Rule 8)")
+    parser.add_argument("--missing_num", default=1, type=int, choices=[1, 2, 3])
     parser.add_argument("--seed", default=2025, type=int)
     parser.add_argument("--cache", default=0.2, type=float)
     parser.add_argument("--distributed", default=False, action="store_true")
@@ -434,10 +447,8 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_accumulation_steps", default=2, type=int)
     parser.add_argument("--DiT", default="MDiT3D-B/2", type=str)
     parser.add_argument("--noise_scheduler", default="linear", type=str)
-    parser.add_argument(
-        "--pred_type", default="x", type=str,
-        choices=["noise", "x", "v"],
-    )
+    parser.add_argument("--pred_type", default="x", type=str,
+                        choices=["noise", "x", "v"])
     parser.add_argument("--diffusion_steps", default=500, type=int)
     parser.add_argument("--sample_steps", default=200, type=int)
     parser.add_argument("--diff_loss", default="l2", type=str)
@@ -461,31 +472,27 @@ if __name__ == "__main__":
     parser.add_argument("--per_weight", default=0.01, type=float)
     parser.add_argument("--adv_weight", default=0.01, type=float)
     parser.add_argument("--pretext_weight", default=0.1, type=float)
+
     args = parser.parse_args()
     for attr in ["vae_channel", "brain_pad", "brain_roi", "brain_size"]:
         val = getattr(args, attr)
         if isinstance(val, str):
             setattr(args, attr, tuple(map(int, val.strip("()").split(","))))
+
+    # ---- Task directory (Rule 7a) ----
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    task_dir = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        f"results/task_{timestamp}"
-    )
-    args.result_dir = os.path.join(task_dir, "stage2_MDiT3D")
-    os.makedirs(args.result_dir, exist_ok=True)
-    args.log_dir = os.path.join(args.result_dir, "log")
-    os.makedirs(args.log_dir, exist_ok=True)
-    args.model_dir = os.path.join(task_dir, "models", "MDiT3D")
-    os.makedirs(args.model_dir, exist_ok=True)
-    args.tb_log_dir = os.path.join(task_dir, "tensorboard", "stage2")
-    os.makedirs(args.tb_log_dir, exist_ok=True)
-    print(f"Task directory: {task_dir}")
-    print(f"Model save dir: {args.model_dir}")
-    print(f"TensorBoard dir: {args.tb_log_dir}")
+    args.task_dir = os.path.join(
+        os.environ.get("COMPARE_ROOT", os.path.dirname(os.path.abspath(__file__))),
+        "results", f"task_{timestamp}")
+    os.makedirs(os.path.join(args.task_dir, "models"), exist_ok=True)
+    os.makedirs(os.path.join(args.task_dir, "tensorboard"), exist_ok=True)
+    os.makedirs(os.path.join(args.task_dir, "logs"), exist_ok=True)
+
     args.resume_ckpt = None
     args.amp = True
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
+
     if "WORLD_SIZE" in os.environ:
         args.distributed = int(os.environ["WORLD_SIZE"]) > 1
     args.world_size = 1
@@ -496,17 +503,19 @@ if __name__ == "__main__":
         args.rank = dist.get_rank()
         args.device = args.rank % torch.cuda.device_count()
         torch.cuda.set_device(args.device)
-        print(
-            f"Distributed training: {torch.cuda.device_count()} GPUs. "
-            f"Process {args.rank}/{args.world_size}"
-        )
     else:
         args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        print(f"Single process training on {args.device}")
+
     assert args.rank >= 0
+
     autoencoder = CopeVAE(args)
     DiT = MDiT3D_models[args.DiT](num_modalities=args.modality_num)
-    print(f"Starting MDiT3D Stage 2 training for {args.epochs} epochs")
-    print(f"Model: {args.DiT}, Missing modalities: {args.missing_num}")
+
+    print(f"Task directory: {args.task_dir}")
+    print(f"Models:        {args.task_dir}/models/")
+    print(f"TensorBoard:   {args.task_dir}/tensorboard/")
+    print(f"Logs:          {args.task_dir}/logs/train.log")
+    print(f"Starting MDiT3D Stage 2: {args.epochs} epochs, {args.DiT}, "
+          f"missing_num={args.missing_num}")
     print(f"AE checkpoint: {args.ae_ckpt}")
     train(args, autoencoder, DiT)

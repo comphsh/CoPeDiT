@@ -135,9 +135,9 @@ if [ -z "$AE_CKPT" ]; then
         echo "ERROR: No results directory found. Stage 1 training may have failed."
         exit 1
     fi
-    AE_CKPT="$LATEST_RESULTS/models/CoPeVAE/Autoencoder.pt"
+    AE_CKPT="$LATEST_RESULTS/models/latest.pt"
     if [ ! -f "$AE_CKPT" ]; then
-        AE_CKPT=$(find "$COMPARE_ROOT"/results -name "Autoencoder.pt" -path "*/CoPeVAE/*" 2>/dev/null | sort | tail -1)
+        AE_CKPT=$(find "$COMPARE_ROOT"/results -name "latest.pt" 2>/dev/null | sort | tail -1)
     fi
 fi
 
